@@ -1,162 +1,117 @@
-import { useMemo, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { Settings2, Wrench } from '@/lib/icons'
-import { cn } from '@/lib/utils'
-import type { EnvVarInfo } from '@/types/hermes'
+import { useI18n } from '@/i18n'
+import { $settingsScopeOverride } from '@/store/settings-scope'
 
-import { EnvVarRow, useEnvCredentials } from './env-credentials'
+import { CredentialKeyCard, credentialPlaceholder, credentialRowLabel } from './credential-key-ui'
+import { useEnvCredentials } from './env-credentials'
 import { asText } from './helpers'
-import { LoadingState, SettingsContent } from './primitives'
+import { SettingsContent, SettingsSkeleton } from './primitives'
+import { SettingsProfileScope } from './profile-scope'
+import { useDeepLinkHighlight } from './use-deep-link-highlight'
+
+// Sub-views surfaced as sidebar subnav under Tools & Keys (see settings/index.tsx).
+export const KEYS_VIEWS = ['tools', 'settings'] as const
+
+export type KeysView = (typeof KEYS_VIEWS)[number]
 
 // Providers live on their own page; messaging-platform credentials live on the
 // dedicated Messaging page (and are hidden here via `channel_managed`). This
 // view covers tool API keys plus server/setting env vars (API server, webhook,
-// gateway), which fold into the Settings tab.
-const KEY_TABS = [
-  { icon: Wrench, id: 'tool', label: 'Tools' },
-  { icon: Settings2, id: 'setting', label: 'Settings' }
-] as const
+// gateway), which fold into the Settings subnav.
 
-type KeyCategoryId = (typeof KEY_TABS)[number]['id']
-
-const CATEGORY_LABELS: Record<KeyCategoryId, string> = {
-  setting: 'Settings',
-  tool: 'Tools'
+// Backend categories that surface under each subnav. Platform credentials use the
+// `messaging` category but are flagged ``channel_managed`` and configured on
+// the Messaging page; only gateway-wide ``messaging`` rows (e.g. GATEWAY_PROXY)
+// appear here alongside ``setting``.
+const VIEW_CATEGORIES: Record<KeysView, readonly string[]> = {
+  settings: ['setting', 'messaging'],
+  tools: ['tool']
 }
 
-// Backend categories that surface under each tab. Server/gateway vars carry the
-// `messaging` category server-side but belong with general settings here, since
-// the platform-credential half of `messaging` is owned by the Messaging page.
-const TAB_CATEGORIES: Record<KeyCategoryId, readonly string[]> = {
-  setting: ['setting', 'messaging'],
-  tool: ['tool']
-}
+const credentialElementId = (key: string) => `credential-key-${key}`
 
-function tabForCategory(category: string): KeyCategoryId | null {
-  for (const tab of KEY_TABS) {
-    if (TAB_CATEGORIES[tab.id].includes(category)) {
-      return tab.id
-    }
-  }
+export function KeysSettings({ view }: KeysSettingsProps) {
+  const { t } = useI18n()
+  // Shared settings "Applies to" scope: fetch + edit the selected profile's
+  // env store instead of the active one (null → active, the default path).
+  const scopeProfile = useStore($settingsScopeOverride)
+  const { rowProps, vars } = useEnvCredentials(scopeProfile)
+  const [openKey, setOpenKey] = useState<null | string>(null)
 
-  return null
-}
+  useEffect(() => {
+    setOpenKey(null)
+  }, [scopeProfile, view])
 
-function CategoryTabs({
-  active,
-  counts,
-  onSelect
-}: {
-  active: KeyCategoryId
-  counts: Record<KeyCategoryId, number>
-  onSelect: (id: KeyCategoryId) => void
-}) {
-  return (
-    <div className="mb-4 inline-flex w-full gap-1 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-bg-tertiary)/30 p-1">
-      {KEY_TABS.map(tab => {
-        const isActive = active === tab.id
-        const count = counts[tab.id]
-
-        return (
-          <button
-            className={cn(
-              'flex flex-1 items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-[length:var(--conversation-text-font-size)] font-medium transition-colors',
-              isActive
-                ? 'bg-(--ui-chat-surface-background) text-foreground shadow-sm'
-                : 'text-(--ui-text-secondary) hover:text-foreground'
-            )}
-            key={tab.id}
-            onClick={() => onSelect(tab.id)}
-            type="button"
-          >
-            <tab.icon className="size-3.5 shrink-0" />
-            <span className="truncate">{tab.label}</span>
-            {count > 0 && (
-              <span
-                className={cn(
-                  'rounded-full px-1.5 text-[0.6875rem] tabular-nums',
-                  isActive ? 'bg-primary/12 text-primary' : 'bg-(--ui-bg-tertiary)/60 text-muted-foreground'
-                )}
-              >
-                {count}
-              </span>
-            )}
-          </button>
-        )
-      })}
-    </div>
-  )
-}
-
-export function KeysSettings() {
-  const { rowProps, vars } = useEnvCredentials()
-  const [activeCategory, setActiveCategory] = useState<KeyCategoryId>('tool')
-
-  const groups = useMemo(() => {
+  const entries = useMemo(() => {
     if (!vars) {
       return []
     }
 
-    return KEY_TABS.map(t => t.id).flatMap(tab => {
-      const cats = TAB_CATEGORIES[tab]
+    const cats = VIEW_CATEGORIES[view]
 
-      const entries = Object.entries(vars)
-        .filter(([, info]) => !info.channel_managed && cats.includes(asText(info.category)))
-        .sort(([a], [b]) => a.localeCompare(b))
+    return Object.entries(vars)
+      .filter(([, info]) => !info.channel_managed && cats.includes(asText(info.category)))
+      .sort(([a], [b]) => a.localeCompare(b))
+  }, [vars, view])
 
-      return entries.length === 0 ? [] : [{ category: tab, label: CATEGORY_LABELS[tab], entries }]
-    })
-  }, [vars])
+  const renderableKeys = useMemo(() => new Set(entries.map(([key]) => key)), [entries])
 
-  // Tab badge counts reflect how many keys are set per tab. Channel-managed
-  // credentials are owned by the Messaging page and excluded here.
-  const categoryCounts = useMemo<Record<KeyCategoryId, number>>(() => {
-    const counts: Record<KeyCategoryId, number> = { setting: 0, tool: 0 }
+  const resolveDeepLink = useCallback((key: string) => {
+    setOpenKey(key)
+  }, [])
 
-    if (!vars) {
-      return counts
-    }
+  const deepLinkReady = useCallback((key: string) => renderableKeys.has(key), [renderableKeys])
 
-    for (const info of Object.values(vars)) {
-      if (!info.is_set || info.channel_managed) {
-        continue
-      }
-
-      const tab = tabForCategory(asText(info.category))
-
-      if (tab) {
-        counts[tab] += 1
-      }
-    }
-
-    return counts
-  }, [vars])
+  // Deep link from ⌘K / Capabilities env-var rows (?tab=keys&key=<ENV_KEY>):
+  // scroll the credential card into view, flash it, and expand it. Only
+  // consume keys rendered by this sub-view so a stale Tools/Settings pairing
+  // cannot keep trying to mount a target this pane never shows.
+  useDeepLinkHighlight({
+    elementId: credentialElementId,
+    onResolve: resolveDeepLink,
+    param: 'key',
+    ready: deepLinkReady
+  })
 
   if (!vars) {
-    return <LoadingState label="Loading API keys and credentials..." />
+    return <SettingsSkeleton sections={[{ rows: 5 }]} />
   }
-
-  const visible = groups.filter(g => g.category === activeCategory)
 
   return (
     <SettingsContent>
-      <CategoryTabs active={activeCategory} counts={categoryCounts} onSelect={setActiveCategory} />
+      <SettingsProfileScope className="mb-5" />
+      {entries.length > 0 ? (
+        <div className="grid gap-2">
+          {entries.map(([key, info]) => {
+            const label = credentialRowLabel(key, info)
 
-      {visible.map(group => (
-        <section className="mb-6" key={group.category}>
-          <div className="grid gap-2">
-            {group.entries.map(([key, info]: [string, EnvVarInfo]) => (
-              <EnvVarRow info={info} key={key} varKey={key} {...rowProps} />
-            ))}
-          </div>
-        </section>
-      ))}
-
-      {visible.length === 0 && (
+            return (
+              <div className="scroll-mt-6 rounded-[6px]" id={credentialElementId(key)} key={key}>
+                <CredentialKeyCard
+                  expanded={openKey === key}
+                  info={info}
+                  label={label}
+                  onExpand={() => setOpenKey(key)}
+                  onToggle={() => setOpenKey(prev => (prev === key ? null : key))}
+                  placeholder={credentialPlaceholder(key, info, label)}
+                  rowProps={rowProps}
+                  varKey={key}
+                />
+              </div>
+            )
+          })}
+        </div>
+      ) : (
         <div className="rounded-lg border border-dashed border-(--ui-stroke-tertiary) px-4 py-8 text-center text-[length:var(--conversation-caption-font-size)] text-muted-foreground">
-          Nothing configured in this category yet.
+          {t.settings.keys.empty}
         </div>
       )}
     </SettingsContent>
   )
+}
+
+interface KeysSettingsProps {
+  view: KeysView
 }
